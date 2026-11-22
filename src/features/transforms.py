@@ -17,15 +17,12 @@ FEATURE_NAMES_V1: tuple[str, ...] = (
     "device_account_degree",
 )
 
-IST_OFFSET_MS: int = 19_800_000  # UTC + 5h30m in milliseconds
+IST_OFFSET_MS: int = 19_800_000
 DAY_MS: int = 86_400_000
 
 
 def transform_batch(df: pl.DataFrame) -> np.ndarray:
-    """
-    Offline batch feature operator phi_1(X; H_<t) -> [N, 11] float64 matrix.
-    Strictly causal and NaN-safe (totality preserved for cold-start rows).
-    """
+    """Offline batch operator phi_1(X; H_<t) -> [N, 11] float64 matrix (NaN-safe)."""
     amt = pl.col("amount_inr").fill_null(0.0).clip(lower_bound=0.0)
     avg_30d = pl.col("avg_amt_30d").fill_null(-1.0)
     tx_24h = pl.col("tx_count_24h").fill_null(0.0).clip(lower_bound=0.0)
@@ -45,29 +42,31 @@ def transform_batch(df: pl.DataFrame) -> np.ndarray:
     ) / 3_600_000.0
     angle = (2.0 * math.pi * hour_ist) / 24.0
 
-    feats = df.select(
-        [
-            amt.alias("amount_inr"),
-            amt.log1p().alias("log_amount"),
-            (amt / avg_30d.clip(lower_bound=1.0)).alias("amt_to_avg_30d_ratio"),
-            pl.col("is_device_missing").fill_null(1.0).cast(pl.Float64),
-            tx_24h.alias("tx_count_24h"),
-            (tx_1h / (tx_24h / 24.0).clip(lower_bound=0.1)).alias("tx_velocity_ratio"),
-            avg_30d.alias("avg_amt_30d"),
-            pl.col("is_cold_start").fill_null(1.0).cast(pl.Float64),
-            angle.sin().alias("hour_sin_ist"),
-            angle.cos().alias("hour_cos_ist"),
-            dev_deg.alias("device_account_degree"),
-        ]
+    return (
+        df.select(
+            [
+                amt.alias("amount_inr"),
+                amt.log1p().alias("log_amount"),
+                (amt / avg_30d.clip(lower_bound=1.0)).alias("amt_to_avg_30d_ratio"),
+                pl.col("is_device_missing").fill_null(1.0).cast(pl.Float64),
+                tx_24h.alias("tx_count_24h"),
+                (tx_1h / (tx_24h / 24.0).clip(lower_bound=0.1)).alias(
+                    "tx_velocity_ratio"
+                ),
+                avg_30d.alias("avg_amt_30d"),
+                pl.col("is_cold_start").fill_null(1.0).cast(pl.Float64),
+                angle.sin().alias("hour_sin_ist"),
+                angle.cos().alias("hour_cos_ist"),
+                dev_deg.alias("device_account_degree"),
+            ]
+        )
+        .to_numpy()
+        .astype(np.float64, copy=False)
     )
-    return feats.to_numpy().astype(np.float64, copy=False)
 
 
 def transform_single(event: Mapping[str, float | int | None]) -> np.ndarray:
-    """
-    Online single-event operator phi_1(x_t; H_<t) -> [1, 11] float64 matrix.
-    Mathematically identical to transform_batch() to guarantee zero training-serving skew.
-    """
+    """Online single-event operator phi_1(x_t; H_<t) -> [1, 11] float64 matrix."""
     amt = max(float(event.get("amount_inr") or 0.0), 0.0)
     avg_30d = (
         float(event["avg_amt_30d"]) if event.get("avg_amt_30d") is not None else -1.0
@@ -75,7 +74,6 @@ def transform_single(event: Mapping[str, float | int | None]) -> np.ndarray:
     tx_24h = max(float(event.get("tx_count_24h") or 0.0), 0.0)
     tx_1h = max(float(event.get("tx_count_1h") or 0.0), 0.0)
     dev_deg = max(float(event.get("device_account_degree") or 0.0), 0.0)
-
     is_dev_missing = float(
         event.get("is_device_missing")
         if event.get("is_device_missing") is not None
