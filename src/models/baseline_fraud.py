@@ -1,15 +1,16 @@
 import numpy as np
-import lightgbm as lgb
+from lightgbm import LGBMClassifier
 from sklearn.isotonic import IsotonicRegression
 
 
 class CalibratedFraudBaseline:
     """
-    Baseline policy pi_{F,0}:
-      1. LightGBM (f_theta) on D_train
-      2. Isotonic Calibration (p_theta) on D_cal
-      3. Split Conformal Abstention (q_{1-alpha}) on D_cal
-      4. Bayes-optimal cost-sensitive action + Lagrangian FPR penalty
+    Phase I Feasible Fraud Policy pi_{F,0}:
+      1. LGBMClassifier trained on D_train
+      2. IsotonicRegression probability calibration on D_cal
+      3. Bayes-optimal rupee expected utility with Lagrangian FPR dual (lambda_FPR*)
+      4. Split Conformal Prediction abstention gate routing ambiguous states to Soft_Hold (2)
+      5. Total, NaN-safe inference implementing predict_proba(states) -> [N, 4]
     """
 
     def __init__(
@@ -17,52 +18,84 @@ class CalibratedFraudBaseline:
         amount_col_idx: int = 0,
         alpha_conformal: float = 0.05,
         max_fpr: float = 0.005,
-        margin_m: float = 0.015,
-        cb_fee: float = 500.0,
-        reg_penalty: float = 2000.0,
+        seed: int = 42,
     ) -> None:
         self.amount_col_idx = amount_col_idx
-        self.alpha = alpha_conformal
+        self.alpha_conformal = alpha_conformal
         self.max_fpr = max_fpr
-        self.margin_m = margin_m
-        self.cb_fee = cb_fee
-        self.reg_penalty = reg_penalty
 
-        # Operational & friction costs: [0=Approve, 1=2FA, 2=SoftHold, 3=HardBlock]
-        self.c_op = np.array([0.0, 1.5, 45.0, 2.0], dtype=np.float64)
-        self.c_fric = np.array([0.0, 15.0, 120.0, 800.0], dtype=np.float64)
-
-        self.model = lgb.LGBMClassifier(
+        self.model = LGBMClassifier(
             n_estimators=300,
-            learning_rate=0.05,
             num_leaves=31,
-            subsample_for_bin=50_000,
-            random_state=42,
-            n_jobs=-1,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=seed,
+            n_jobs=1,  # Deterministic single-thread inference for p99.9 latency stability
             verbose=-1,
         )
-        self.calibrator = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        self.calibrator = IsotonicRegression(
+            y_min=1e-6, y_max=1.0 - 1e-6, out_of_bounds="clip"
+        )
         self.q_conformal: float = 1.0
         self.lambda_fpr: float = 0.0
 
-    def _expected_utility(
-        self, p_fraud: np.ndarray, amounts: np.ndarray, lam_fpr: float
-    ) -> np.ndarray:
-        """Computes E[R_F(s, a, y)] - lam_fpr * I(a != 0) * (1 - p) for all 4 actions."""
-        p_legit = 1.0 - p_fraud
-        n = len(p_fraud)
-        eu = np.empty((n, 4), dtype=np.float64)
-
-        # Action 0: Approve
-        eu[:, 0] = p_legit * (self.margin_m * amounts) - p_fraud * (
-            amounts + self.cb_fee + self.reg_penalty
+    @staticmethod
+    def _sanitize(states: np.ndarray) -> np.ndarray:
+        """Guarantees totality on NaN/Inf stress inputs."""
+        return np.nan_to_num(
+            np.asarray(states, dtype=np.float64), nan=0.0, posinf=1e8, neginf=-1e8
         )
 
-        # Actions 1, 2, 3: Intervene (2FA, Soft_Hold, Hard_Block)
-        for a in (1, 2, 3):
-            eu[:, a] = -p_legit * (self.c_fric[a] + lam_fpr) - self.c_op[a]
+    def _expected_utility(
+        self,
+        p_fraud: np.ndarray,
+        amounts_inr: np.ndarray,
+        lam_fpr: float,
+    ) -> np.ndarray:
+        """
+        Computes E[R_F(s, a, Y) - lam_fpr * I(a != 0) * (1 - Y)] for a in {0, 1, 2, 3}.
+        Actions: 0=Approve, 1=2FA, 2=Soft_Hold, 3=Hard_Block.
+        """
+        p = p_fraud
+        q = 1.0 - p
+        amt = np.maximum(amounts_inr, 0.0)
 
-        return eu
+        # Payoffs under legitimate (y=0) and fraud (y=1) outcomes in INR
+        r0_legit = 0.002 * amt
+        r0_fraud = -(amt + 2500.0)
+
+        r1_legit = np.full_like(amt, -15.0)
+        r1_fraud = -0.15 * (amt + 2500.0) - 15.0  # 85% fraud deterrence via 2FA
+
+        r2_legit = np.full_like(amt, -150.0)
+        r2_fraud = np.full_like(amt, -100.0)  # Ops review cost; principal saved
+
+        r3_legit = np.full_like(amt, -500.0)  # Legitimate customer churn cost
+        r3_fraud = np.zeros_like(amt)
+
+        u0 = p * r0_fraud + q * r0_legit
+        u1 = p * r1_fraud + q * (r1_legit - lam_fpr)
+        u2 = p * r2_fraud + q * (r2_legit - lam_fpr)
+        u3 = p * r3_fraud + q * (r3_legit - lam_fpr)
+
+        return np.stack([u0, u1, u2, u3], axis=1)
+
+    def _select_actions(
+        self,
+        p_fraud: np.ndarray,
+        amounts_inr: np.ndarray,
+        lam_fpr: float,
+    ) -> np.ndarray:
+        utils = self._expected_utility(p_fraud, amounts_inr, lam_fpr)
+        actions = np.argmax(utils, axis=1)
+
+        # Split Conformal abstention: if both y=0 and y=1 are in Gamma_alpha(s), route to Soft_Hold (2)
+        in_set_fraud = (1.0 - p_fraud) <= self.q_conformal
+        in_set_legit = p_fraud <= self.q_conformal
+        ambiguous = in_set_fraud & in_set_legit
+        actions = np.where(ambiguous, 2, actions)
+        return actions
 
     def fit(
         self,
@@ -71,29 +104,34 @@ class CalibratedFraudBaseline:
         x_cal: np.ndarray,
         y_cal: np.ndarray,
     ) -> "CalibratedFraudBaseline":
-        # 1. Fit GBDT on D_train
-        self.model.fit(x_train, y_train)
+        x_tr = self._sanitize(x_train)
+        x_ca = self._sanitize(x_cal)
+        y_tr = np.asarray(y_train, dtype=np.int64)
+        y_ca = np.asarray(y_cal, dtype=np.int64)
 
-        # 2. Fit Isotonic Calibrator on D_cal
-        raw_cal = self.model.predict_proba(x_cal)[:, 1]
-        self.calibrator.fit(raw_cal, y_cal)
+        # 1. Fit raw GBDT risk scorer on D_train
+        self.model.fit(x_tr, y_tr)
+
+        # 2. Fit Isotonic probability calibrator strictly on D_cal
+        raw_cal = self.model.predict_proba(x_ca)[:, 1]
+        self.calibrator.fit(raw_cal, y_ca)
         p_cal = self.calibrator.predict(raw_cal)
 
-        # 3. Compute Split Conformal Quantile q_{1-alpha} on D_cal
-        n_cal = len(y_cal)
-        scores = np.where(y_cal == 1, 1.0 - p_cal, p_cal)
-        level = min(1.0, np.ceil((n_cal + 1) * (1.0 - self.alpha)) / n_cal)
-        self.q_conformal = float(np.quantile(scores, level, method="higher"))
+        # 3. Compute Split Conformal quantile q_{1 - alpha} on D_cal
+        n_cal = len(y_ca)
+        true_class_prob = np.where(y_ca == 1, p_cal, 1.0 - p_cal)
+        nonconformity = 1.0 - true_class_prob
+        q_level = min(np.ceil((n_cal + 1) * (1.0 - self.alpha_conformal)) / n_cal, 1.0)
+        self.q_conformal = float(np.quantile(nonconformity, q_level, method="higher"))
 
-        # 4. Tune lambda_fpr via binary search on D_cal to satisfy FPR <= max_fpr
-        amounts_cal = np.clip(
-            np.nan_to_num(x_cal[:, self.amount_col_idx], nan=0.0), 0.0, 1e9
-        )
-        legit_mask = y_cal == 0
+        # 4. 1D Bisection for minimum lambda_FPR* satisfying FPR <= max_fpr on D_cal
+        amounts_cal = x_ca[:, self.amount_col_idx]
+        legit_mask = y_ca == 0
+
         lo, hi = 0.0, 1e6
         for _ in range(30):
             mid = 0.5 * (lo + hi)
-            actions = np.argmax(self._expected_utility(p_cal, amounts_cal, mid), axis=1)
+            actions = self._select_actions(p_cal, amounts_cal, lam_fpr=mid)
             fpr = float(np.mean(actions[legit_mask] != 0))
             if fpr > self.max_fpr:
                 lo = mid
@@ -103,25 +141,13 @@ class CalibratedFraudBaseline:
         return self
 
     def predict_proba(self, states: np.ndarray) -> np.ndarray:
-        """Total, NaN-safe policy returning action probabilities [N, 4] for EvaluationOracle."""
-        # LightGBM handles NaN features natively; sanitize amount column for rupee math
-        raw_probs = self.model.predict_proba(states)[:, 1]
-        p_fraud = self.calibrator.predict(raw_probs)
-        amounts = np.clip(
-            np.nan_to_num(states[:, self.amount_col_idx], nan=0.0), 0.0, 1e9
-        )
+        """Total, NaN-safe deterministic policy returning action probabilities [N, 4]."""
+        x = self._sanitize(states)
+        raw = self.model.predict_proba(x)[:, 1]
+        p_fraud = self.calibrator.predict(raw)
+        amounts = x[:, self.amount_col_idx]
 
-        # Bayes-optimal action under calibrated probabilities & tuned FPR penalty
-        eu = self._expected_utility(p_fraud, amounts, self.lambda_fpr)
-        actions = np.argmax(eu, axis=1)
-
-        # Conformal Abstention: if both y=0 and y=1 are plausible (|Gamma_alpha| == 2), route to Soft_Hold (2)
-        in_set_1 = (1.0 - p_fraud) <= self.q_conformal
-        in_set_0 = p_fraud <= self.q_conformal
-        ambiguous = in_set_1 & in_set_0
-        actions = np.where(ambiguous, 2, actions)
-
-        # Return valid probability simplex [N, 4]
-        probs = np.zeros((len(states), 4), dtype=np.float64)
-        probs[np.arange(len(states)), actions] = 1.0
+        actions = self._select_actions(p_fraud, amounts, lam_fpr=self.lambda_fpr)
+        probs = np.zeros((len(x), 4), dtype=np.float64)
+        probs[np.arange(len(x)), actions] = 1.0
         return probs
